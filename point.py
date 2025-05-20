@@ -59,52 +59,33 @@
 
 import torch
 import spconv.pytorch as spconv
-from torch import nn
 
-class Point(dict):
+class Point:
     def __init__(self, data_dict):
-        super().__init__()
-        self.coord = data_dict["coord"]          # (N, 3)
-        self.feat = data_dict["feat"]            # (N, C)
-        self.label = data_dict.get("label", None)
-        self.batch = data_dict["batch"].view(-1)  # (N,)
-        self.grid_size = 0.02  # fixed float
-
-        self.grid_coord = (self.coord / self.grid_size).floor().int()
-        self.offset = self._batch2offset(self.batch)
+        self.coord = data_dict["coord"]             # (N, 3)
+        self.feat = data_dict["feat"]               # (N, C)
+        self.label = data_dict.get("label", None)   # (N, ) optional
+        self.batch = data_dict["batch"].view(-1)     # (N,)
+        self.grid_size = 0.02                         # default fixed float
+        self.grid_coord = (self.coord / self.grid_size).floor().int()  # (N, 3)
+        self.offset = self._batch2offset(self.batch)  # (B+1,)
 
     def _batch2offset(self, batch):
         batch = batch.view(-1).to("cpu")
         count = torch.bincount(batch)
         return torch.cumsum(count, dim=0).long()
 
-    def serialization(self, order="z", depth=None, shuffle_orders=False):
-        # 为避免 key 写入报错，这里不再使用 self[...] = ...
-        self.serialized_depth = 0
-        self.serialized_code = None
-        self.serialized_order = None
-        self.serialized_inverse = None
-        self.order = order
-
     def sparsify(self, pad=96):
-        # ⚠️ 确保 grid_coord 非负，避免稀疏张量索引越界
-        min_coord = self.grid_coord.min(dim=0).values
-        self.grid_coord = self.grid_coord - min_coord
-
-        sparse_shape = (self.grid_coord.max(dim=0).values + pad).tolist()
-
+        sparse_shape = torch.max(self.grid_coord, dim=0).values + pad  # (3,)
         indices = torch.cat([
-            self.batch.view(-1, 1).int(),
-            self.grid_coord.int()
-        ], dim=1)
+            self.batch.unsqueeze(-1).int(),   # (N,1)
+            self.grid_coord.int()             # (N,3)
+        ], dim=1)                             # (N,4)
 
-        sparse_conv_feat = spconv.SparseConvTensor(
+        self.sparse_conv_feat = spconv.SparseConvTensor(
             features=self.feat,
             indices=indices,
-            spatial_shape=sparse_shape,
-            batch_size=int(self.batch.max().item()) + 1,
+            spatial_shape=sparse_shape.tolist(),
+            batch_size=int(self.batch.max().item()) + 1
         )
-
-        self.sparse_shape = sparse_shape
-        self.sparse_conv_feat = sparse_conv_feat
 
