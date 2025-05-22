@@ -18,6 +18,25 @@ class EarDataset(Dataset):
             if fname.endswith(".npy")
         ])
 
+def __getitem__(self, idx):
+    arr = np.load(self.file_list[idx])  # shape (N, 7)
+    coord = arr[:, :3].astype(np.float32)
+    normal = arr[:, 3:6].astype(np.float32)
+    segment = arr[:, 6].astype(np.int64)
+    feat = np.concatenate([coord, normal], axis=1).astype(np.float32)  # (N, 6)
+
+    data_dict = dict(
+        coord=coord,
+        normal=normal,
+        segment=segment,
+        feat=feat  # 👈 这是关键
+    )
+
+    if self.transform:
+        data_dict = self.transform(data_dict)
+
+    return data_dict
+
 
 
 data = dict(
