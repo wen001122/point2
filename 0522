@@ -1,0 +1,87 @@
+data = dict(
+    num_classes=2,
+    ignore_index=-1,
+    names=["non-ear", "ear"],
+    train=dict(
+        type="EarDataset",
+        split="train",
+        data_root="data/dataset",
+        test_mode=False,
+        transform=[
+            dict(type="ToTensor"),
+            dict(
+                type="Collect",
+                keys=("coord", "segment"),
+                feat_keys=("normal",)
+            )
+        ]
+    ),
+    val=dict(
+        type="EarDataset",
+        split="val",
+        data_root="data/dataset",
+        test_mode=True,
+        transform=[
+            dict(type="ToTensor"),
+            dict(
+                type="Collect",
+                keys=("coord", "segment"),
+                feat_keys=("normal",)
+            )
+        ]
+    ),
+    test=dict(
+        type="EarDataset",
+        split="test",
+        data_root="data/dataset",
+        test_mode=True,
+        transform=[
+            dict(type="ToTensor"),
+            dict(
+                type="Collect",
+                keys=("coord",),
+                feat_keys=("normal",)
+            )
+        ],
+        test_cfg=dict(  # 如果没有 voxelize 或 TTA 需求，可移除 test_cfg
+            voxelize=None,
+            crop=None,
+            post_transform=[],
+            aug_transform=[]
+        )
+    )
+)
+
+
+
+import os
+import glob
+import numpy as np
+from torch.utils.data import Dataset
+from pointcept.datasets.builder import DATASETS
+
+@DATASETS.register_module()
+class EarDataset(Dataset):
+    def __init__(self, split="train", data_root="data/dataset", transform=None, test_mode=False):
+        self.split = split
+        self.test_mode = test_mode
+        self.data_root = data_root
+        self.transform = transform
+        self.file_list = sorted(glob.glob(os.path.join(data_root, split, "*.npy")))
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        arr = np.load(self.file_list[idx])  # shape: (N, 7)
+        coord = arr[:, :3].astype(np.float32)
+        normal = arr[:, 3:6].astype(np.float32)
+        segment = arr[:, 6].astype(np.int64)
+
+        data_dict = dict(coord=coord, normal=normal, segment=segment)
+
+        if self.transform:
+            data_dict = self.transform(data_dict)
+
+        return data_dict
+
