@@ -1,11 +1,15 @@
 
 
 class EarDataset(Dataset):
-    def __init__(self, split="train", data_root="Pointcept/data/dataset", transform=None, test_mode=False):
+    def __init__(self, split="train", data_root="Pointcept/data/dataset", transform=None, test_mode=False, loop=None):
         self.split = split
         self.data_root = data_root
-        self.transform = transform
         self.test_mode = test_mode
+        self.loop = loop
+        if transform is not None:
+            self.transform = Compose(transform)
+        else:
+            self.transform = lambda x: x  # 不使用增强
 
         split_dir = os.path.join(self.data_root, self.split)
         self.file_list = sorted([
@@ -13,21 +17,6 @@ class EarDataset(Dataset):
             for fname in os.listdir(split_dir)
             if fname.endswith(".npy")
         ])
-
-    def __len__(self):
-        return len(self.file_list)
-
-    def __getitem__(self, idx):
-        arr = np.load(self.file_list[idx])  # shape (N, 7)
-        coord = arr[:, :3].astype(np.float32)
-        normal = arr[:, 3:6].astype(np.float32)
-        segment = arr[:, 6].astype(np.int64)
-
-        data_dict = dict(coord=coord, normal=normal, segment=segment)
-        if self.transform:
-            data_dict = self.transform(data_dict)
-        return data_dict
-
 
 
 
