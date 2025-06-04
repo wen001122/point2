@@ -1,100 +1,118 @@
+@TESTERS.register_module()
+class SemSegTester(TesterBase):
+    def test(self):
+        assert self.test_loader.batch_size == 1
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
 
+        batch_time = AverageMeter()
+        intersection_meter = AverageMeter()
+        union_meter = AverageMeter()
+        target_meter = AverageMeter()
+        self.model.eval()
 
-class EarDataset(Dataset):
-    def __init__(self, split="train", data_root="Pointcept/data/dataset", transform=None, test_mode=False, loop=None):
-        self.split = split
-        self.data_root = data_root
-        self.test_mode = test_mode
-        self.loop = loop
-        if transform is not None:
-            self.transform = Compose(transform)
-        else:
-            self.transform = lambda x: x  # 不使用增强
+        save_path = os.path.join(self.cfg.save_path, "result")
+        make_dirs(save_path)
 
-        split_dir = os.path.join(self.data_root, self.split)
-        self.file_list = sorted([
-            os.path.join(split_dir, fname)
-            for fname in os.listdir(split_dir)
-            if fname.endswith(".npy")
-        ])
+        # 只保留与当前数据集相关的部分
+        if comm.is_main_process():
+            make_dirs(os.path.join(save_path, "submit"))
 
-def __getitem__(self, idx):
-    arr = np.load(self.file_list[idx])  # shape (N, 7)
-    coord = arr[:, :3].astype(np.float32)
-    normal = arr[:, 3:6].astype(np.float32)
-    segment = arr[:, 6].astype(np.int64)
-    feat = np.concatenate([coord, normal], axis=1).astype(np.float32)  # (N, 6)
+        comm.synchronize()
+        record = {}
 
-    data_dict = dict(
-        coord=coord,
-        normal=normal,
-        segment=segment,
-        feat=feat  # 👈 这是关键
-    )
+        for idx, data_dict in enumerate(self.test_loader):
+            start = time.time()
+            data_dict = data_dict[0]  # current assume batch size is 1
 
-    if self.transform:
-        data_dict = self.transform(data_dict)
+            # 只保留需要的部分，删除不需要的字段
+            segment = data_dict.pop("segment")  # 真实标签
+            feat = data_dict.pop("feat")  # 输入特征
+            pred_save_path = os.path.join(save_path, f"{data_dict.get('name', 'unnamed')}_pred.npy")
+            
+            if os.path.isfile(pred_save_path):
+                logger.info(f"{idx + 1}/{len(self.test_loader)}: Loaded pred and label.")
+                pred = np.load(pred_save_path)
+                if "origin_segment" in data_dict:
+                    segment = data_dict["origin_segment"]
+            else:
+                # 直接使用 'feat' 进行预测
+                pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
 
-    return data_dict
+                # 只保留 feat 字段进行预测
+                input_dict = {"feat": feat}
+                for key in input_dict.keys():
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
 
+                with torch.no_grad():
+                    pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
+                    pred_part = F.softmax(pred_part, -1)
+                    pred = pred_part.max(1)[1].data.cpu().numpy()
 
+                np.save(pred_save_path, pred)
 
-data = dict(
-    num_classes=2,
-    ignore_index=-1,
-    names=["non-ear", "ear"],
-    train=dict(
-        type="EarDataset",
-        split="train",
-        data_root="Pointcept/data/dataset",
-        transform=[
-            dict(type="GridSample", grid_size=0.02, hash_type="fnv", mode="train", return_grid_coord=True),
-            dict(type="ToTensor"),
-            dict(
-                type="Collect",
-                keys=("coord", "grid_coord", "segment"),
-                feat_keys=("normal",),
-            ),
-        ],
-        test_mode=False,
-    ),
-    val=dict(
-        type="EarDataset",
-        split="val",
-        data_root="Pointcept/data/dataset",
-        transform=[
-            dict(type="GridSample", grid_size=0.02, hash_type="fnv", mode="train", return_grid_coord=True),
-            dict(type="ToTensor"),
-            dict(
-                type="Collect",
-                keys=("coord", "grid_coord", "segment"),
-                feat_keys=("normal",),
-            ),
-        ],
-        test_mode=False,
-    ),
-    test=dict(
-        type="EarDataset",
-        split="test",
-        data_root="Pointcept/data/dataset",
-        transform=[
-            dict(type="GridSample", grid_size=0.02, hash_type="fnv", mode="test", return_grid_coord=True),
-        ],
-        test_mode=True,
-        test_cfg=dict(
-            voxelize=dict(type="GridSample", grid_size=0.02, hash_type="fnv", mode="test", return_grid_coord=True),
-            crop=None,
-            post_transform=[
-                dict(type="ToTensor"),
-                dict(
-                    type="Collect",
-                    keys=("coord", "grid_coord", "index"),
-                    feat_keys=("normal",),
-                ),
-            ],
-            aug_transform=[
-                [dict(type="RandomScale", scale=[1.0, 1.0])],
-            ],
-        ),
-    ),
-)
+            # 根据数据集类型保存预测结果
+            np.savetxt(
+                os.path.join(save_path, "submit", f"{data_dict.get('name', 'unnamed')}.txt"),
+                pred.astype(np.int32),
+                delimiter=",",
+                fmt="%d",
+            )
+
+            # 计算交集、并集、目标、IoU等评估指标
+            intersection, union, target = intersection_and_union(
+                pred, segment, self.cfg.data.num_classes, self.cfg.data.ignore_index
+            )
+            intersection_meter.update(intersection)
+            union_meter.update(union)
+            target_meter.update(target)
+            record[data_dict.get('name', 'unnamed')] = dict(intersection=intersection, union=union, target=target)
+
+            mask = union != 0
+            iou_class = intersection / (union + 1e-10)
+            iou = np.mean(iou_class[mask])
+            acc = sum(intersection) / (sum(target) + 1e-10)
+
+            m_iou = np.mean(intersection_meter.sum / (union_meter.sum + 1e-10))
+            m_acc = np.mean(intersection_meter.sum / (target_meter.sum + 1e-10))
+
+            batch_time.update(time.time() - start)
+            logger.info(
+                f"Test: {data_dict.get('name', 'unnamed')} [{idx + 1}/{len(self.test_loader)}]-{segment.size} "
+                f"Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) "
+                f"Accuracy {acc:.4f} ({m_acc:.4f}) "
+                f"mIoU {iou:.4f} ({m_iou:.4f})"
+            )
+
+        logger.info("Syncing ...")
+        comm.synchronize()
+        record_sync = comm.gather(record, dst=0)
+
+        if comm.is_main_process():
+            record = {}
+            for _ in range(len(record_sync)):
+                r = record_sync.pop()
+                record.update(r)
+                del r
+            intersection = np.sum([meters["intersection"] for _, meters in record.items()], axis=0)
+            union = np.sum([meters["union"] for _, meters in record.items()], axis=0)
+            target = np.sum([meters["target"] for _, meters in record.items()], axis=0)
+
+            iou_class = intersection / (union + 1e-10)
+            accuracy_class = intersection / (target + 1e-10)
+            mIoU = np.mean(iou_class)
+            mAcc = np.mean(accuracy_class)
+            allAcc = sum(intersection) / (sum(target) + 1e-10)
+
+            logger.info(f"Val result: mIoU/mAcc/allAcc {mIoU:.4f}/{mAcc:.4f}/{allAcc:.4f}")
+            for i in range(self.cfg.data.num_classes):
+                logger.info(
+                    f"Class_{i} - {self.cfg.data.names[i]} Result: iou/accuracy {iou_class[i]:.4f}/{accuracy_class[i]:.4f}"
+                )
+            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+
+    @staticmethod
+    def collate_fn(batch):
+        return batch  # No need to modify collate_fn since we are handling the data as-is.
+
